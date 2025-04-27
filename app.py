@@ -1,7 +1,11 @@
+import os
+# Disable Streamlit's file watcher to avoid torch._classes issues on deploy
+os.environ["STREAMLIT_SERVER_FILE_WATCHER_TYPE"] = "none"
+
 import streamlit as st
 import tempfile
-import os
 import base64
+import io
 from streamlit.runtime.scriptrunner import RerunException, RerunData
 
 # Constants
@@ -25,18 +29,19 @@ def set_background(image_path):
         </style>
         """, unsafe_allow_html=True)
 
-# Load and cache the pretrained separator model lazily to avoid Streamlit watcher issues
-@st.cache_resource
+# Load and cache the pretrained separator model lazily
 def get_separator():
-    import torch
-    from model import HybridPercussionSeparator
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    separator = HybridPercussionSeparator().to(device)
-    checkpoint = torch.load(MODEL_CHECKPOINT, map_location=device)
-    separator.load_state_dict(checkpoint)
-    separator.eval()
-    return separator, device
+    @st.cache_resource
+    def _load():
+        import torch
+        from model import HybridPercussionSeparator
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        sep = HybridPercussionSeparator().to(device)
+        checkpoint = torch.load(MODEL_CHECKPOINT, map_location=device)
+        sep.load_state_dict(checkpoint)
+        sep.eval()
+        return sep, device
+    return _load()
 
 # Load audio file and resample if needed
 def load_audio_file(filepath, target_sr=SAMPLE_RATE):
@@ -53,8 +58,7 @@ def separate_track(separator, device, mixture, duration=None):
     import torch
     if duration is not None:
         num_samples = int(duration * SAMPLE_RATE)
-        if mixture.size(1) > num_samples:
-            mixture = mixture[:, :num_samples]
+        mixture = mixture[:, :num_samples]
     with torch.no_grad():
         batch = mixture.unsqueeze(0).to(device)
         drums = separator(batch).squeeze(0)
@@ -89,31 +93,27 @@ def main():
         duration = st.slider("Max duration (seconds)", min_value=1.0, max_value=60.0, value=10.0)
 
         if uploaded and st.button("Process"):
-            separator, device = get_separator()
+            sep, dev = get_separator()
             with st.spinner("Processing audio..."):
-                # Save uploaded to temp file
                 tmp_in = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
                 tmp_in.write(uploaded.read()); tmp_in.flush()
 
-                # Separate
                 mixture = load_audio_file(tmp_in.name)
-                drums, acc = separate_track(separator, device, mixture, duration)
+                drums, acc = separate_track(sep, dev, mixture, duration)
 
-                # Write outputs
                 t1 = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
                 t2 = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
                 import torchaudio
                 torchaudio.save(t1.name, drums, SAMPLE_RATE)
                 torchaudio.save(t2.name, acc, SAMPLE_RATE)
 
-            # Display audio players
             for label, path in [("Original Audio", tmp_in.name), ("Separated Drums", t1.name), ("Accompaniment", t2.name)]:
                 st.markdown(f"<div style='text-align:center;color:white;'><strong>{label}</strong></div>", unsafe_allow_html=True)
-                data = open(path, "rb").read()
-                st.audio(data, format="audio/wav")
+                with open(path, "rb") as f:
+                    audio_buffer = io.BytesIO(f.read())
+                st.audio(audio_buffer, format="audio/wav")
 
         if st.button("Reset"):
-            # Clear state by rerunning
             raise RerunException(RerunData())
 
 # Entry point
